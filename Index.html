@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>J.A.R.V.I.S.</title>
+<style>
+  body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;background:#05070d;color:#7fdfff;font-family:-apple-system,sans-serif;text-align:center;padding:20px;box-sizing:border-box}
+  #ring{width:160px;height:160px;border-radius:50%;border:4px solid #7fdfff;box-shadow:0 0 30px #7fdfff;transition:.3s}
+  #ring.active{border-color:#ffb347;box-shadow:0 0 50px #ffb347}
+  #ring.play{animation:pulse 1s infinite}
+  @keyframes pulse{50%{transform:scale(1.08)}}
+  button,label{background:#0e2233;color:#7fdfff;border:1px solid #7fdfff;border-radius:12px;padding:14px 22px;font-size:17px}
+  #status{font-size:18px;min-height:3em}
+  #heard{font-size:13px;opacity:.6;min-height:1.5em}
+  input{display:none}
+</style>
+</head>
+<body>
+  <div id="ring"></div>
+  <div id="status">Wähle zuerst dein Lied</div>
+  <div id="heard"></div>
+  <label id="pick" for="file">🎵 Lied wählen</label>
+  <input type="file" id="file" accept="audio/*">
+  <button id="start" disabled>Start</button>
+  <audio id="song"></audio>
+
+<script>
+const THRESHOLD = 0.3;    // Klatsch-Lautstärke (0–1)
+const MIN_GAP = 150, MAX_GAP = 800, DEBOUNCE = 100; // ms
+const CLAP_WINDOW = 10000; // 10 s Zeit zum Klatschen
+
+const $ = id => document.getElementById(id);
+const song = $("song"), statusEl = $("status"), heard = $("heard"), ring = $("ring");
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec, phase = "idle", ctx, stream, src;
+
+$("file").onchange = e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  song.src = URL.createObjectURL(f);
+  statusEl.textContent = "„" + f.name + "“ geladen – tippe auf Start";
+  $("start").disabled = false;
+};
+
+$("start").onclick = async () => {
+  // Audio + Mikrofon für iOS freischalten (geht nur nach einem Tipp)
+  song.muted = true;
+  try { await song.play(); } catch (e) {}
+  song.pause(); song.currentTime = 0; song.muted = false;
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  await ctx.resume();
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+    s.getTracks().forEach(t => t.stop());
+  } catch (e) { statusEl.textContent = "Kein Mikrofonzugriff 😕"; return; }
+  $("start").style.display = "none";
+  $("pick").style.display = "none";
+  startListening();
+};
+
+ring.onclick = () => { // Tippen auf den Ring stoppt die Musik
+  if (phase === "play") { song.pause(); startListening(); }
+};
+
+function startListening() {
+  if (!SR) { statusEl.textContent = "Spracherkennung nicht verfügbar 😕"; return; }
+  phase = "listen";
+  ring.className = "";
+  statusEl.textContent = "Sag: „Wake up, Daddy's home“";
+  heard.textContent = "";
+  rec = new SR();
+  rec.lang = "en-US";
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.onresult = ev => {
+    let t = "";
+    for (const r of ev.results) t += r[0].transcript + " ";
+    t = t.toLowerCase();
+    heard.textContent = t.trim();
+    if (phase === "listen" && t.includes("wake") && t.includes("home")) {
+      phase = "clap";
+      rec.stop();
+    }
+  };
+  rec.onend = () => {
+    if (phase === "listen") setTimeout(() => { try { rec.start(); } catch (e) {} }, 300);
+    else if (phase === "clap") startClapPhase();
+  };
+  rec.start();
+}
+
+async function startClapPhase() {
+  statusEl.textContent = "👏👏 Jetzt zweimal klatschen!";
+  ring.className = "active";
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+  } catch (e) { statusEl.textContent = "Kein Mikrofonzugriff 😕"; return; }
+  await ctx.resume();
+  src = ctx.createMediaStreamSource(stream);
+  const an = ctx.createAnalyser();
+  an.fftSize = 1024;
+  src.connect(an);
+  const buf = new Float32Array(an.fftSize);
+  const t0 = performance.now();
+  let lastPeak = 0, lastClap = 0;
+
+  (function loop() {
+    an.getFloatTimeDomainData(buf);
+    let peak = 0;
+    for (const v of buf) peak = Math.max(peak, Math.abs(v));
+    const now = performance.now();
+    if (peak > THRESHOLD && now - lastPeak > DEBOUNCE) {
+      lastPeak = now;
+      const gap = now - lastClap;
+      if (gap > MIN_GAP && gap < MAX_GAP) { stopMic(); playSong(); return; }
+      lastClap = now;
+    }
+    if (now - t0 > CLAP_WINDOW) {
+      stopMic();
+      statusEl.textContent = "⏱️ Zu spät – sag den Satz nochmal";
+      setTimeout(startListening, 1500);
+      return;
+    }
+    requestAnimationFrame(loop);
+  })();
+}
+
+function stopMic() {
+  stream.getTracks().forEach(t => t.stop());
+  src.disconnect();
+}
+
+function playSong() {
+  phase = "play";
+  ring.className = "play";
+  statusEl.textContent = "🎶 Willkommen zuhause, Sir.";
+  heard.textContent = "Tippe auf den Ring zum Stoppen";
+  song.currentTime = 0;
+  song.play();
+  song.onended = startListening;
+}
+</script>
+</body>
+</html>
