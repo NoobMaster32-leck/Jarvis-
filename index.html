@@ -3,37 +3,61 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
 <title>J.A.R.V.I.S.</title>
 <style>
   body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;background:#05070d;color:#7fdfff;font-family:-apple-system,sans-serif;text-align:center;padding:20px;box-sizing:border-box}
-  #ring{width:160px;height:160px;border-radius:50%;border:4px solid #7fdfff;box-shadow:0 0 30px #7fdfff;transition:.3s}
+  #ring{width:160px;height:160px;border-radius:50%;border:4px solid #7fdfff;box-shadow:0 0 30px #7fdfff;transition:.15s}
   #ring.active{border-color:#ffb347;box-shadow:0 0 50px #ffb347}
-  #ring.play{animation:pulse 1s infinite}
+  #ring.play{border-color:#ffb347;box-shadow:0 0 50px #ffb347;animation:pulse 1s infinite}
   @keyframes pulse{50%{transform:scale(1.08)}}
-  button,label{background:#0e2233;color:#7fdfff;border:1px solid #7fdfff;border-radius:12px;padding:14px 22px;font-size:17px}
+  button,label.btn{background:#0e2233;color:#7fdfff;border:1px solid #7fdfff;border-radius:12px;padding:14px 22px;font-size:17px}
   #status{font-size:18px;min-height:3em}
-  #heard{font-size:13px;opacity:.6;min-height:1.5em}
-  input{display:none}
+  #hint{font-size:13px;opacity:.6;min-height:1.5em}
+  #meter{width:220px;height:8px;border-radius:4px;background:#0e2233;overflow:hidden;position:relative}
+  #level{height:100%;width:0;background:#7fdfff}
+  #mark{position:absolute;top:0;bottom:0;width:2px;background:#ffb347}
+  #sensBox{font-size:14px;display:flex;flex-direction:column;gap:6px;align-items:center}
+  input[type=range]{width:220px}
+  input[type=file]{display:none}
 </style>
 </head>
 <body>
   <div id="ring"></div>
   <div id="status">Wähle zuerst dein Lied</div>
-  <div id="heard"></div>
-  <label id="pick" for="file">🎵 Lied wählen</label>
+  <div id="hint"></div>
+  <div id="meter"><div id="level"></div><div id="mark"></div></div>
+  <div id="sensBox">
+    Empfindlichkeit
+    <input type="range" id="sens" min="20" max="95" value="70">
+  </div>
+  <label class="btn" id="pick" for="file">🎵 Lied wählen</label>
   <input type="file" id="file" accept="audio/*">
   <button id="start" disabled>Start</button>
-  <audio id="song"></audio>
+  <audio id="song" playsinline></audio>
 
 <script>
-const THRESHOLD = 0.3;    // Klatsch-Lautstärke (0–1)
-const MIN_GAP = 150, MAX_GAP = 800, DEBOUNCE = 100; // ms
-const CLAP_WINDOW = 10000; // 10 s Zeit zum Klatschen
+const MIN_GAP = 150, MAX_GAP = 800, DEBOUNCE = 100; // ms zwischen den zwei Klatschern
 
 const $ = id => document.getElementById(id);
-const song = $("song"), statusEl = $("status"), heard = $("heard"), ring = $("ring");
-const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-let rec, phase = "idle", ctx, stream, src;
+const song = $("song"), statusEl = $("status"), hint = $("hint"), ring = $("ring");
+let phase = "idle", ctx, stream, src, listenId = 0, wakeLock = null;
+let threshold = 1 - $("sens").value / 100;
+
+function updateMark() { $("mark").style.left = (threshold * 100) + "%"; }
+$("sens").oninput = e => { threshold = 1 - e.target.value / 100; updateMark(); };
+updateMark();
+
+// iOS: "playback" = über Lautsprecher und auch im Stummmodus hörbar
+function setSession(type) {
+  try { if (navigator.audioSession) navigator.audioSession.type = type; } catch (e) {}
+}
+
+// Display wach halten, solange die Seite offen ist
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
+}
 
 $("file").onchange = e => {
   const f = e.target.files[0];
@@ -44,16 +68,14 @@ $("file").onchange = e => {
 };
 
 $("start").onclick = async () => {
-  // Audio + Mikrofon für iOS freischalten (geht nur nach einem Tipp)
+  // Audio für iOS freischalten (geht nur nach einem Tipp)
+  setSession("playback");
   song.muted = true;
   try { await song.play(); } catch (e) {}
   song.pause(); song.currentTime = 0; song.muted = false;
   ctx = new (window.AudioContext || window.webkitAudioContext)();
   await ctx.resume();
-  try {
-    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
-    s.getTracks().forEach(t => t.stop());
-  } catch (e) { statusEl.textContent = "Kein Mikrofonzugriff 😕"; return; }
+  keepAwake();
   $("start").style.display = "none";
   $("pick").style.display = "none";
   startListening();
@@ -62,86 +84,79 @@ $("start").onclick = async () => {
 ring.onclick = () => { // Tippen auf den Ring stoppt die Musik
   if (phase === "play") { song.pause(); startListening(); }
 };
+song.onended = () => { if (phase === "play") startListening(); };
 
-function startListening() {
-  if (!SR) { statusEl.textContent = "Spracherkennung nicht verfügbar 😕"; return; }
+async function startListening() {
+  const id = ++listenId;
   phase = "listen";
   ring.className = "";
-  statusEl.textContent = "Sag: „Wake up, Daddy's home“";
-  heard.textContent = "";
-  rec = new SR();
-  rec.lang = "en-US";
-  rec.continuous = true;
-  rec.interimResults = true;
-  rec.onresult = ev => {
-    let t = "";
-    for (const r of ev.results) t += r[0].transcript + " ";
-    t = t.toLowerCase();
-    heard.textContent = t.trim();
-    if (phase === "listen" && t.includes("wake") && t.includes("home")) {
-      phase = "clap";
-      rec.stop();
-    }
-  };
-  rec.onend = () => {
-    if (phase === "listen") setTimeout(() => { try { rec.start(); } catch (e) {} }, 300);
-    else if (phase === "clap") startClapPhase();
-  };
-  rec.start();
-}
-
-async function startClapPhase() {
-  statusEl.textContent = "👏👏 Jetzt zweimal klatschen!";
-  ring.className = "active";
+  statusEl.textContent = "👏👏 Zweimal klatschen";
+  hint.textContent = "";
+  setSession("play-and-record");
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
     });
-  } catch (e) { statusEl.textContent = "Kein Mikrofonzugriff 😕"; return; }
+  } catch (e) {
+    phase = "idle";
+    statusEl.textContent = "Kein Mikrofonzugriff 😕 – Seite neu laden und erlauben";
+    return;
+  }
   await ctx.resume();
   src = ctx.createMediaStreamSource(stream);
   const an = ctx.createAnalyser();
   an.fftSize = 1024;
   src.connect(an);
   const buf = new Float32Array(an.fftSize);
-  const t0 = performance.now();
   let lastPeak = 0, lastClap = 0;
 
   (function loop() {
+    if (id !== listenId || phase !== "listen") return;
     an.getFloatTimeDomainData(buf);
     let peak = 0;
     for (const v of buf) peak = Math.max(peak, Math.abs(v));
+    $("level").style.width = Math.min(100, peak * 100) + "%";
     const now = performance.now();
-    if (peak > THRESHOLD && now - lastPeak > DEBOUNCE) {
+    if (peak > threshold && now - lastPeak > DEBOUNCE) {
       lastPeak = now;
-      const gap = now - lastClap;
-      if (gap > MIN_GAP && gap < MAX_GAP) { stopMic(); playSong(); return; }
+      if (now - lastClap > MIN_GAP && now - lastClap < MAX_GAP) { playSong(); return; }
       lastClap = now;
-    }
-    if (now - t0 > CLAP_WINDOW) {
-      stopMic();
-      statusEl.textContent = "⏱️ Zu spät – sag den Satz nochmal";
-      setTimeout(startListening, 1500);
-      return;
+      ring.className = "active";
+      setTimeout(() => { if (phase === "listen") ring.className = ""; }, 300);
     }
     requestAnimationFrame(loop);
   })();
 }
 
 function stopMic() {
-  stream.getTracks().forEach(t => t.stop());
-  src.disconnect();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (src) src.disconnect();
+  stream = src = null;
 }
 
 function playSong() {
   phase = "play";
+  stopMic();               // Mikro aus, sonst schickt iOS den Ton an den Hörer
+  setSession("playback");  // ... und zurück auf den Lautsprecher
+  $("level").style.width = "0";
   ring.className = "play";
   statusEl.textContent = "🎶 Willkommen zuhause, Sir.";
-  heard.textContent = "Tippe auf den Ring zum Stoppen";
+  hint.textContent = "Tippe auf den Ring zum Stoppen";
   song.currentTime = 0;
-  song.play();
-  song.onended = startListening;
+  song.play().catch(() => {
+    hint.textContent = "Abspielen blockiert – tippe auf den Ring";
+  });
 }
+
+// Nach dem Zurückkehren in die Seite: Display-Sperre und Mikro neu holen
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  keepAwake();
+  if (phase === "listen") {
+    const dead = !stream || stream.getTracks().every(t => t.readyState !== "live");
+    if (dead) { stopMic(); startListening(); }
+  }
+});
 </script>
 </body>
 </html>
